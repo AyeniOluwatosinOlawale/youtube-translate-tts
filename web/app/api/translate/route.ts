@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import ytdl from '@distube/ytdl-core';
-import OpenAI from 'openai';
+import OpenAI, { toFile } from 'openai';
 import { Readable } from 'stream';
 
 export const maxDuration = 300;
@@ -125,7 +125,7 @@ export async function POST(req: NextRequest) {
 
       // Step 2: Transcribe
       await send({ step: 'transcribing', message: 'Transcribing audio...' });
-      const audioFile = new File([audioBuffer], 'audio.webm', { type: 'audio/webm' });
+      const audioFile = await toFile(audioBuffer, 'audio.webm', { type: 'audio/webm' });
       const transcriptionResponse = await client.audio.transcriptions.create({
         model: 'gpt-4o-mini-transcribe',
         file: audioFile,
