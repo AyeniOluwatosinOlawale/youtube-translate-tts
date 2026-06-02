@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { YoutubeTranscript } from 'youtube-transcript';
-import OpenAI from 'openai';
+import { Innertube } from 'youtubei.js';
+import OpenAI, { toFile } from 'openai';
 
 export const maxDuration = 300;
 
@@ -30,7 +31,6 @@ function splitText(text: string, maxChars = 4096): string[] {
   const chunks: string[] = [];
   let current = '';
   const terminators = ['. ', '! ', '? ', '.\n', '!\n', '?\n'];
-
   let i = 0;
   let segStart = 0;
   while (i < text.length) {
@@ -73,6 +73,40 @@ async function synthesizeSpeech(client: OpenAI, text: string, voice: string): Pr
   return Buffer.concat(buffers);
 }
 
+// Fetch captions from YouTube — returns null if unavailable
+async function fetchCaptions(videoId: string): Promise<string | null> {
+  try {
+    const items = await YoutubeTranscript.fetchTranscript(videoId);
+    if (!items || items.length === 0) return null;
+    return items.map((i) => i.text).join(' ').replace(/\s+/g, ' ').trim();
+  } catch {
+    return null;
+  }
+}
+
+// Download audio using youtubei.js internal API — avoids streaming URL bot-detection
+async function downloadAudioBuffer(videoId: string): Promise<Buffer> {
+  const yt = await Innertube.create({ retrieve_player: false });
+  const info = await yt.getInfo(videoId);
+
+  const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+  if (!format?.url) {
+    throw new Error('No audio format URL found for this video.');
+  }
+
+  const res = await fetch(format.url, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to fetch audio: HTTP ${res.status}`);
+  }
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
 export async function POST(req: NextRequest) {
   const encoder = new TextEncoder();
   const transform = new TransformStream<Uint8Array, Uint8Array>();
@@ -103,49 +137,57 @@ export async function POST(req: NextRequest) {
       }
       const client = new OpenAI({ apiKey });
 
-      // Step 1: Fetch transcript from YouTube captions
-      await send({ step: 'downloading', message: 'Fetching transcript from YouTube...' });
-
       const videoId = extractVideoId(url.trim());
       if (!videoId) {
-        await send({ step: 'error', message: 'Could not extract a video ID from that URL. Make sure it is a valid YouTube link.' });
+        await send({ step: 'error', message: 'Could not extract a video ID from that URL.' });
         return;
       }
 
-      let transcript: string;
-      try {
-        const items = await YoutubeTranscript.fetchTranscript(videoId);
-        if (!items || items.length === 0) {
-          await send({ step: 'error', message: 'No captions found for this video. Try a video that has subtitles enabled.' });
+      // Step 1a: Try captions first (fast, no API cost)
+      await send({ step: 'downloading', message: 'Fetching transcript from YouTube...' });
+      let transcript = await fetchCaptions(videoId);
+
+      // Step 1b: No captions — fall back to audio download + Whisper
+      if (!transcript) {
+        await send({ step: 'downloading', message: 'No captions found — downloading audio...' });
+        let audioBuffer: Buffer;
+        try {
+          audioBuffer = await downloadAudioBuffer(videoId);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await send({ step: 'error', message: `Could not download audio: ${msg}` });
           return;
         }
-        transcript = items.map((item) => item.text).join(' ').replace(/\s+/g, ' ').trim();
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await send({
-          step: 'error',
-          message: `Could not fetch captions: ${msg}. Try a video with subtitles/captions enabled.`,
-        });
+
+        await send({ step: 'transcribing', message: 'Transcribing audio with AI...' });
+        try {
+          const audioFile = await toFile(audioBuffer, 'audio.mp4', { type: 'audio/mp4' });
+          const result = await client.audio.transcriptions.create({
+            model: 'gpt-4o-mini-transcribe',
+            file: audioFile,
+            response_format: 'text',
+          });
+          transcript = result as unknown as string;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await send({ step: 'error', message: `Transcription failed: ${msg}` });
+          return;
+        }
+      } else {
+        await send({ step: 'transcribing', message: 'Transcript ready.' });
+      }
+
+      if (!transcript?.trim()) {
+        await send({ step: 'error', message: 'No speech or captions found in this video.' });
         return;
       }
 
-      if (!transcript.trim()) {
-        await send({ step: 'error', message: 'Transcript is empty.' });
-        return;
-      }
-
-      // Step 2 (merged): emit transcribing done
-      await send({ step: 'transcribing', message: 'Transcript ready.' });
-
-      // Step 3: Translate
+      // Step 2: Translate
       await send({ step: 'translating', message: `Translating to ${language}...` });
       const translationResponse = await client.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
-          {
-            role: 'system',
-            content: SYSTEM_PROMPT.replace(/{language}/g, language),
-          },
+          { role: 'system', content: SYSTEM_PROMPT.replace(/{language}/g, language) },
           { role: 'user', content: transcript },
         ],
         temperature: 0.3,
@@ -153,12 +195,11 @@ export async function POST(req: NextRequest) {
       });
       const translation = translationResponse.choices[0].message.content?.trim() ?? '';
 
-      // Step 4: TTS
+      // Step 3: TTS
       await send({ step: 'speaking', message: 'Generating speech...' });
       const mp3Buffer = await synthesizeSpeech(client, translation, voice);
       const audioBase64 = mp3Buffer.toString('base64');
 
-      // Step 5: Done
       await send({ step: 'done', transcript, translation, audio: audioBase64 });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'An unexpected error occurred.';
