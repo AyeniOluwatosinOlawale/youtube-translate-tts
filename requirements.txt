@@ -1,0 +1,4 @@
+openai>=1.30.0
+yt-dlp>=2024.4.9
+python-dotenv>=1.0.0
+pydub>=0.25.1
