@@ -1,262 +1,361 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+
+/* ---------- YouTube IFrame API types ---------- */
+declare global {
+  interface Window {
+    YT: {
+      Player: new (el: HTMLElement, opts: object) => YTPlayer;
+      PlayerState: { PLAYING: number; PAUSED: number; ENDED: number };
+    };
+    onYouTubeIframeAPIReady: () => void;
+  }
+}
+interface YTPlayer {
+  playVideo(): void;
+  pauseVideo(): void;
+  mute(): void;
+  getCurrentTime(): number;
+  destroy(): void;
+}
+
+/* ---------- Data types ---------- */
+interface Segment {
+  index: number;
+  original: string;
+  translated: string;
+  offset: number;    // ms from video start
+  duration: number;  // ms
+  audio: string | null; // base64 mp3
+}
+
+type Phase = 'idle' | 'preparing' | 'ready' | 'playing' | 'error';
 
 const LANGUAGES = [
   'Spanish', 'French', 'German', 'Italian', 'Portuguese',
   'Japanese', 'Korean', 'Chinese (Simplified)', 'Arabic',
   'Hindi', 'Russian', 'Dutch', 'Polish', 'Turkish',
 ];
-
 const VOICES = ['nova', 'alloy', 'echo', 'fable', 'onyx', 'shimmer'];
 
-const STEPS = [
-  { key: 'downloading', label: 'Fetch transcript from YouTube' },
-  { key: 'transcribing', label: 'Transcript ready' },
-  { key: 'translating', label: 'Translate text' },
-  { key: 'speaking', label: 'Generate audio' },
-] as const;
-
-type StepKey = typeof STEPS[number]['key'] | 'idle' | 'done' | 'error';
-
-interface Result {
-  transcript: string;
-  translation: string;
-  audio: string;
+function extractId(url: string) {
+  return url.match(/(?:v=|youtu\.be\/|\/shorts\/|\/live\/)([a-zA-Z0-9_-]{11})/)?.[1] ?? null;
 }
 
-const STEP_ORDER: StepKey[] = ['downloading', 'transcribing', 'translating', 'speaking', 'done'];
-
+/* ================================================ */
 export default function Home() {
-  const [url, setUrl] = useState('');
+  const [url, setUrl]           = useState('');
   const [language, setLanguage] = useState('Spanish');
-  const [voice, setVoice] = useState('nova');
-  const [currentStep, setCurrentStep] = useState<StepKey>('idle');
-  const [stepMessage, setStepMessage] = useState('');
-  const [result, setResult] = useState<Result | null>(null);
-  const [error, setError] = useState('');
-  const audioRef = useRef<HTMLAudioElement>(null);
+  const [voice, setVoice]       = useState('nova');
+  const [phase, setPhase]       = useState<Phase>('idle');
+  const [videoId, setVideoId]   = useState('');
+  const [total, setTotal]       = useState(0);
+  const [ready, setReady]       = useState(0);
+  const [subtitle, setSubtitle] = useState('');
+  const [error, setError]       = useState('');
+  const [statusMsg, setStatus]  = useState('');
 
-  const isBusy = currentStep !== 'idle' && currentStep !== 'done' && currentStep !== 'error';
+  const playerRef    = useRef<YTPlayer | null>(null);
+  const audioRef     = useRef<HTMLAudioElement | null>(null);
+  const segmentsRef  = useRef<Segment[]>([]);
+  const curSegRef    = useRef(-1);
+  const syncRef      = useRef<ReturnType<typeof setInterval> | null>(null);
+  const phaseRef     = useRef<Phase>('idle');
+  const abortRef     = useRef<AbortController | null>(null);
 
-  function isStepComplete(key: string): boolean {
-    if (currentStep === 'done') return true;
-    const cur = STEP_ORDER.indexOf(currentStep as StepKey);
-    const check = STEP_ORDER.indexOf(key as StepKey);
-    return check < cur;
+  function updatePhase(p: Phase) { phaseRef.current = p; setPhase(p); }
+
+  /* ---- Load YouTube IFrame API once ---- */
+  useEffect(() => {
+    if (typeof window === 'undefined' || window.YT) return;
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+  }, []);
+
+  /* ---- Transition to ready once enough audio is buffered ---- */
+  useEffect(() => {
+    if (phaseRef.current === 'preparing' && total > 0 && ready >= Math.min(5, total)) {
+      updatePhase('ready');
+    }
+  }, [ready, total]);
+
+  /* ---- Init YouTube player ---- */
+  const initPlayer = useCallback((vid: string) => {
+    playerRef.current?.destroy();
+    const mount = () => {
+      const el = document.getElementById('yt-mount');
+      if (!el) return;
+      playerRef.current = new window.YT.Player(el as HTMLElement, {
+        videoId: vid,
+        width: '100%',
+        height: '100%',
+        playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1 },
+        events: {
+          onReady: () => playerRef.current?.mute(),
+          onStateChange: (e: { data: number }) => {
+            if (e.data === 1) startSync();  // PLAYING
+            else stopSync();
+          },
+        },
+      });
+    };
+    if (window.YT?.Player) mount();
+    else window.onYouTubeIframeAPIReady = mount;
+  }, []);
+
+  /* ---- Sync loop: every 100ms, play correct TTS segment ---- */
+  function startSync() {
+    if (syncRef.current) return;
+    syncRef.current = setInterval(() => {
+      if (!playerRef.current) return;
+      const ms   = playerRef.current.getCurrentTime() * 1000;
+      const segs = segmentsRef.current;
+      const idx  = segs.findIndex(s => ms >= s.offset && ms < s.offset + s.duration);
+
+      if (idx !== curSegRef.current) {
+        curSegRef.current = idx;
+        if (idx >= 0) {
+          setSubtitle(segs[idx].translated);
+          const a = audioRef.current;
+          if (a && segs[idx].audio) {
+            a.pause();
+            a.src = `data:audio/mpeg;base64,${segs[idx].audio}`;
+            a.play().catch(() => {});
+          }
+        } else {
+          setSubtitle('');
+          audioRef.current?.pause();
+        }
+      }
+    }, 100);
   }
 
-  function isStepActive(key: string): boolean {
-    return currentStep === key;
+  function stopSync() {
+    if (syncRef.current) { clearInterval(syncRef.current); syncRef.current = null; }
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  /* ---- Main: load video + start processing ---- */
+  async function handleLoad(e: React.FormEvent) {
     e.preventDefault();
-    if (!url.trim() || isBusy) return;
+    const vid = extractId(url);
+    if (!vid) { setError('Invalid YouTube URL.'); return; }
 
-    setCurrentStep('downloading');
-    setStepMessage('');
-    setResult(null);
+    // Abort any running stream
+    abortRef.current?.abort();
+    abortRef.current = new AbortController();
+
+    // Reset state
     setError('');
+    setSubtitle('');
+    setTotal(0);
+    setReady(0);
+    segmentsRef.current = [];
+    curSegRef.current = -1;
+    stopSync();
 
+    setVideoId(vid);
+    updatePhase('preparing');
+    setStatus('Fetching captions…');
+
+    // Init YouTube player
+    requestAnimationFrame(() => setTimeout(() => initPlayer(vid), 300));
+
+    // Stream processing
+    let res: Response;
     try {
-      const res = await fetch('/api/translate', {
+      res = await fetch('/api/process', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim(), language, voice }),
+        body: JSON.stringify({ videoId: vid, language, voice }),
+        signal: abortRef.current.signal,
       });
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') return;
+      setError('Network error — could not reach the server.');
+      updatePhase('error');
+      return;
+    }
 
-      if (!res.body) throw new Error('No response body');
+    if (!res.body) { setError('Empty server response.'); updatePhase('error'); return; }
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
+    const reader  = res.body.getReader();
+    const dec     = new TextDecoder();
+    let buf       = '';
+    const acc: Segment[] = [];
 
+    try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buf += decoder.decode(value, { stream: true });
+        buf += dec.decode(value, { stream: true });
         const parts = buf.split('\n\n');
         buf = parts.pop() ?? '';
+
         for (const part of parts) {
           if (!part.startsWith('data: ')) continue;
-          const data = JSON.parse(part.slice(6));
-          setCurrentStep(data.step as StepKey);
-          if (data.message) setStepMessage(data.message);
-          if (data.step === 'done') {
-            setResult({ transcript: data.transcript, translation: data.translation, audio: data.audio });
+          const d = JSON.parse(part.slice(6));
+
+          if (d.type === 'total') {
+            setTotal(d.count);
+            for (let i = 0; i < d.count; i++)
+              acc.push({ index: i, original: '', translated: '', offset: 0, duration: 0, audio: null });
+            setStatus(`Translating ${d.count} segments…`);
           }
-          if (data.step === 'error') {
-            setError(data.message ?? 'Unknown error');
+
+          if (d.type === 'segment') {
+            acc[d.index] = { ...acc[d.index], ...d };
+          }
+
+          if (d.type === 'audio') {
+            acc[d.index] = { ...acc[d.index], audio: d.audio };
+            const r = acc.filter(s => s.audio !== null).length;
+            setReady(r);
+            segmentsRef.current = [...acc];
+            setStatus(`Generating audio… ${r} / ${acc.length}`);
+          }
+
+          if (d.type === 'done') {
+            segmentsRef.current = [...acc];
+            updatePhase('ready');
+            setStatus('Ready!');
+          }
+
+          if (d.type === 'error') {
+            setError(d.message);
+            updatePhase('error');
+            return;
           }
         }
       }
-    } catch (err) {
-      setCurrentStep('error');
-      setError(err instanceof Error ? err.message : 'Network error');
+    } catch (e) {
+      if ((e as Error).name !== 'AbortError') {
+        setError('Stream interrupted.');
+        updatePhase('error');
+      }
     }
   }
 
-  function downloadAudio() {
-    if (!result) return;
-    const bytes = Uint8Array.from(atob(result.audio), (c) => c.charCodeAt(0));
-    const blob = new Blob([bytes], { type: 'audio/mpeg' });
-    const blobUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = blobUrl;
-    a.download = `translated_${language.toLowerCase().replace(/\s+/g, '_')}.mp3`;
-    a.click();
-    URL.revokeObjectURL(blobUrl);
+  function handlePlay() {
+    playerRef.current?.mute();
+    playerRef.current?.playVideo();
+    updatePhase('playing');
+    curSegRef.current = -1;
+    setSubtitle('');
   }
 
-  const audioSrc = result ? `data:audio/mpeg;base64,${result.audio}` : '';
+  const pct = total > 0 ? Math.round((ready / total) * 100) : 0;
 
   return (
-    <main className="min-h-screen bg-[#080808] text-white flex flex-col items-center px-4 py-16">
-      <div className="w-full max-w-xl">
+    <main className="min-h-screen bg-[#080808] text-white flex flex-col items-center px-4 py-12">
+      <audio ref={audioRef} className="hidden" />
 
+      <div className="w-full max-w-2xl">
         {/* Header */}
-        <div className="text-center mb-12">
-          <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-indigo-600 mb-5">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <div className="text-center mb-8">
+          <div className="inline-flex items-center justify-center w-11 h-11 rounded-2xl bg-indigo-600 mb-4">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
               <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
               <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
             </svg>
           </div>
           <h1 className="text-2xl font-semibold tracking-tight mb-1">YouTube Translator</h1>
-          <p className="text-zinc-500 text-sm">Transcribe · Translate · Speak</p>
+          <p className="text-zinc-500 text-sm">Watch any YouTube video in your language</p>
         </div>
 
         {/* Form */}
-        <form onSubmit={handleSubmit} className="space-y-4 mb-8">
-          <div>
-            <label className="block text-xs font-medium uppercase tracking-widest text-zinc-500 mb-2">
-              YouTube URL
-            </label>
+        <form onSubmit={handleLoad} className="space-y-3 mb-6">
+          <div className="flex gap-2">
             <input
               type="url"
               value={url}
-              onChange={(e) => setUrl(e.target.value)}
+              onChange={e => setUrl(e.target.value)}
               placeholder="https://youtube.com/watch?v=..."
-              disabled={isBusy}
               required
-              className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm placeholder-zinc-600 outline-none focus:border-indigo-500 transition-colors disabled:opacity-50"
+              className="flex-1 bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-500 transition-colors placeholder-zinc-600"
             />
+            <button
+              type="submit"
+              disabled={phase === 'preparing'}
+              className="bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-700 disabled:cursor-not-allowed rounded-xl px-5 py-3 text-sm font-medium transition-colors shrink-0"
+            >
+              {phase === 'preparing' ? '…' : 'Load'}
+            </button>
           </div>
 
           <div className="flex gap-3">
-            <div className="flex-1">
-              <label className="block text-xs font-medium uppercase tracking-widest text-zinc-500 mb-2">
-                Language
-              </label>
-              <select
-                value={language}
-                onChange={(e) => setLanguage(e.target.value)}
-                disabled={isBusy}
-                className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-500 transition-colors disabled:opacity-50"
-              >
-                {LANGUAGES.map((l) => <option key={l}>{l}</option>)}
-              </select>
-            </div>
-            <div className="flex-1">
-              <label className="block text-xs font-medium uppercase tracking-widest text-zinc-500 mb-2">
-                Voice
-              </label>
-              <select
-                value={voice}
-                onChange={(e) => setVoice(e.target.value)}
-                disabled={isBusy}
-                className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-500 transition-colors disabled:opacity-50"
-              >
-                {VOICES.map((v) => (
-                  <option key={v} value={v}>{v.charAt(0).toUpperCase() + v.slice(1)}</option>
-                ))}
-              </select>
-            </div>
+            <select value={language} onChange={e => setLanguage(e.target.value)}
+              className="flex-1 bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-500 transition-colors">
+              {LANGUAGES.map(l => <option key={l}>{l}</option>)}
+            </select>
+            <select value={voice} onChange={e => setVoice(e.target.value)}
+              className="flex-1 bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-500 transition-colors">
+              {VOICES.map(v => <option key={v} value={v}>{v.charAt(0).toUpperCase() + v.slice(1)}</option>)}
+            </select>
           </div>
-
-          <button
-            type="submit"
-            disabled={isBusy || !url.trim()}
-            className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed rounded-xl py-3 font-medium text-sm transition-colors"
-          >
-            {isBusy ? 'Processing…' : 'Translate'}
-          </button>
         </form>
 
-        {/* Progress */}
-        {currentStep !== 'idle' && currentStep !== 'error' && (
-          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 mb-6 space-y-3">
-            {STEPS.map(({ key, label }) => {
-              const done = isStepComplete(key);
-              const active = isStepActive(key);
-              return (
-                <div key={key} className="flex items-center gap-3 text-sm">
-                  <span className={`w-5 h-5 flex items-center justify-center rounded-full text-xs flex-shrink-0
-                    ${done ? 'bg-green-500 text-black' : active ? 'bg-indigo-600 text-white' : 'bg-zinc-800 text-zinc-600'}`}>
-                    {done ? '✓' : active ? (
-                      <span className="animate-spin inline-block">↻</span>
-                    ) : '·'}
-                  </span>
-                  <span className={done ? 'text-zinc-400' : active ? 'text-white' : 'text-zinc-600'}>
-                    {active && stepMessage ? stepMessage : label}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
         {/* Error */}
-        {currentStep === 'error' && (
-          <div className="bg-red-950/60 border border-red-800 rounded-xl p-4 mb-6 text-sm text-red-300">
-            <span className="font-medium">Error: </span>{error}
+        {error && (
+          <div className="bg-red-950/60 border border-red-800 rounded-xl p-4 text-sm text-red-300 mb-5">
+            {error}
           </div>
         )}
 
-        {/* Results */}
-        {result && (
-          <div className="space-y-4">
-            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
-              <p className="text-xs font-medium uppercase tracking-widest text-zinc-500 mb-3">Original Transcript</p>
-              <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto">
-                {result.transcript}
-              </p>
-            </div>
+        {/* YouTube Player */}
+        {videoId && (
+          <div className="relative bg-black rounded-2xl overflow-hidden mb-5" style={{ paddingTop: '56.25%' }}>
+            <div id="yt-mount" className="absolute inset-0 w-full h-full" />
+            {/* Subtitle overlay */}
+            {subtitle && (
+              <div className="absolute bottom-14 left-0 right-0 flex justify-center px-6 pointer-events-none z-10">
+                <p className="bg-black/85 backdrop-blur-sm text-white text-sm rounded-lg px-4 py-2 text-center max-w-lg leading-relaxed shadow-lg">
+                  {subtitle}
+                </p>
+              </div>
+            )}
+          </div>
+        )}
 
-            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
-              <p className="text-xs font-medium uppercase tracking-widest text-zinc-500 mb-3">
-                Translation · {language}
-              </p>
-              <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto">
-                {result.translation}
-              </p>
+        {/* Progress bar while preparing */}
+        {phase === 'preparing' && total > 0 && (
+          <div className="mb-5">
+            <div className="flex justify-between text-xs text-zinc-500 mb-1.5">
+              <span>{statusMsg}</span>
+              <span>{pct}%</span>
             </div>
-
-            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
-              <p className="text-xs font-medium uppercase tracking-widest text-zinc-500 mb-4">Translated Audio</p>
-              <audio
-                ref={audioRef}
-                src={audioSrc}
-                controls
-                className="w-full mb-4 rounded-lg"
-              />
-              <button
-                onClick={downloadAudio}
-                className="w-full border border-zinc-700 hover:border-zinc-500 hover:bg-zinc-800 rounded-xl py-2.5 text-sm transition-colors"
-              >
-                Download MP3
-              </button>
+            <div className="bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+              <div className="bg-indigo-500 h-full transition-all duration-300" style={{ width: `${pct}%` }} />
             </div>
+          </div>
+        )}
 
+        {phase === 'preparing' && total === 0 && (
+          <p className="text-center text-sm text-zinc-500 animate-pulse mb-5">{statusMsg}</p>
+        )}
+
+        {/* Play button */}
+        {phase === 'ready' && (
+          <div className="text-center">
+            {ready < total && (
+              <p className="text-xs text-zinc-500 mb-3">{ready}/{total} segments ready — rest loading in background</p>
+            )}
             <button
-              onClick={() => { setCurrentStep('idle'); setResult(null); setUrl(''); }}
-              className="w-full text-zinc-500 hover:text-zinc-300 text-sm py-2 transition-colors"
+              onClick={handlePlay}
+              className="bg-indigo-600 hover:bg-indigo-500 rounded-xl px-10 py-3.5 font-semibold text-sm transition-colors"
             >
-              Start over
+              ▶ Play with Translation
             </button>
           </div>
+        )}
+
+        {/* Playing status */}
+        {phase === 'playing' && (
+          <p className="text-center text-xs text-zinc-600">
+            {ready < total ? `Loading remaining segments… ${ready}/${total}` : `All ${total} segments loaded ✓`}
+          </p>
         )}
       </div>
     </main>
