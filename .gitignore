@@ -8,3 +8,5 @@ output/
 *.wav
 *.m4a
 .DS_Store
+web/.next/
+web/node_modules/
