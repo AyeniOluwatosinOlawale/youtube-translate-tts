@@ -43,6 +43,63 @@ function extractId(url: string) {
   return url.match(/(?:v=|youtu\.be\/|\/shorts\/|\/live\/)([a-zA-Z0-9_-]{11})/)?.[1] ?? null;
 }
 
+type RawCaption = { text: string; offset: number; duration: number };
+
+function parseTimedEvents(events: Array<{ segs?: Array<{ utf8?: string }>; tStartMs?: number; dDurationMs?: number }>): RawCaption[] {
+  return events
+    .filter(e => e.segs?.length && typeof e.tStartMs === 'number')
+    .map(e => ({
+      text: (e.segs ?? []).map(s => s.utf8 ?? '').join('').replace(/\n/g, ' ').trim(),
+      offset: e.tStartMs as number,
+      duration: e.dDurationMs ?? 3000,
+    }))
+    .filter(i => i.text.length > 0);
+}
+
+// Fetch captions client-side using the browser's residential IP.
+// Vercel datacenter IPs are blocked by YouTube; the user's browser is not.
+async function fetchCaptionsInBrowser(videoId: string): Promise<RawCaption[] | null> {
+  // Strategy A: InnerTube player API (IOS/WEB clients)
+  const bodies = [
+    { videoId, context: { client: { clientName: 'IOS', clientVersion: '19.09.3', deviceMake: 'Apple', deviceModel: 'iPhone14,3', osName: 'iPhone', osVersion: '17.5.1.21F90', hl: 'en', gl: 'US' } } },
+    { videoId, context: { client: { clientName: 'WEB', clientVersion: '2.20240401.00.00', hl: 'en', gl: 'US' } } },
+  ];
+  for (const body of bodies) {
+    try {
+      const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const tracks: Array<{ baseUrl: string; languageCode?: string }> | undefined =
+        data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      if (!tracks?.length) continue;
+      const track = tracks.find(t => t.languageCode?.startsWith('en')) ?? tracks[0];
+      if (!track?.baseUrl) continue;
+      const u = new URL(track.baseUrl);
+      u.searchParams.set('fmt', 'json3');
+      const cr = await fetch(u.toString());
+      if (!cr.ok) continue;
+      const items = parseTimedEvents((await cr.json()).events ?? []);
+      if (items.length > 0) return items;
+    } catch { /* CORS or network error — try next */ }
+  }
+
+  // Strategy B: unsigned timedtext URL (works for auto-captions on some videos)
+  for (const lang of ['en', 'en-US', 'a.en']) {
+    try {
+      const res = await fetch(`https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=json3`);
+      if (!res.ok) continue;
+      const items = parseTimedEvents((await res.json()).events ?? []);
+      if (items.length > 0) return items;
+    } catch { /* try next */ }
+  }
+
+  return null;
+}
+
 /* ================================================ */
 export default function Home() {
   const [url, setUrl]           = useState('');
@@ -162,13 +219,30 @@ export default function Home() {
     // Init YouTube player
     requestAnimationFrame(() => setTimeout(() => initPlayer(vid), 300));
 
+        // Fetch captions via edge function (Cloudflare IPs, not blocked by YouTube)
+    let browserCaptions: RawCaption[] | null = null;
+    try {
+      const cr = await fetch(`/api/captions?videoId=${vid}`);
+      if (cr.ok) {
+        const cd = await cr.json() as { items?: RawCaption[] | null; debug?: string };
+        if (cd.items?.length) {
+          browserCaptions = cd.items;
+          setStatus(`Got ${browserCaptions.length} caption segments — translating…`);
+        } else {
+          // Edge route returned no captions — fall back to browser-direct fetch
+          browserCaptions = await fetchCaptionsInBrowser(vid);
+          if (browserCaptions) setStatus(`Got ${browserCaptions.length} caption segments — translating…`);
+        }
+      }
+    } catch { /* server will fall back */ }
+
     // Stream processing
     let res: Response;
     try {
       res = await fetch('/api/process', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ videoId: vid, language, voice }),
+        body: JSON.stringify({ videoId: vid, language, voice, captions: browserCaptions }),
         signal: abortRef.current.signal,
       });
     } catch (e) {

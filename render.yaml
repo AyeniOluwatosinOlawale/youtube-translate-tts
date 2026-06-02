@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: youtube-translator
+    runtime: node
+    rootDir: web
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: NODE_ENV
+        value: production
