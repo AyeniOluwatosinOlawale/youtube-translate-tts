@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import ytdl from '@distube/ytdl-core';
-import OpenAI, { toFile } from 'openai';
-import { Readable } from 'stream';
+import { YoutubeTranscript } from 'youtube-transcript';
+import OpenAI from 'openai';
 
 export const maxDuration = 300;
 
@@ -21,13 +20,9 @@ Rules:
 - Format for natural spoken audio — no bullet points, no headers
 - If the source language is already {language}, return the text unchanged`;
 
-function streamToBuffer(stream: Readable): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
-    stream.on('end', () => resolve(Buffer.concat(chunks)));
-    stream.on('error', reject);
-  });
+function extractVideoId(url: string): string | null {
+  const match = url.match(/(?:v=|youtu\.be\/|\/shorts\/|\/live\/)([a-zA-Z0-9_-]{11})/);
+  return match ? match[1] : null;
 }
 
 function splitText(text: string, maxChars = 4096): string[] {
@@ -108,35 +103,39 @@ export async function POST(req: NextRequest) {
       }
       const client = new OpenAI({ apiKey });
 
-      // Step 1: Download audio
-      await send({ step: 'downloading', message: 'Downloading audio from YouTube...' });
-      let audioBuffer: Buffer;
+      // Step 1: Fetch transcript from YouTube captions
+      await send({ step: 'downloading', message: 'Fetching transcript from YouTube...' });
+
+      const videoId = extractVideoId(url.trim());
+      if (!videoId) {
+        await send({ step: 'error', message: 'Could not extract a video ID from that URL. Make sure it is a valid YouTube link.' });
+        return;
+      }
+
+      let transcript: string;
       try {
-        const audioStream = ytdl(url.trim(), {
-          filter: 'audioonly',
-          quality: 'highestaudio',
-        });
-        audioBuffer = await streamToBuffer(audioStream as unknown as Readable);
+        const items = await YoutubeTranscript.fetchTranscript(videoId);
+        if (!items || items.length === 0) {
+          await send({ step: 'error', message: 'No captions found for this video. Try a video that has subtitles enabled.' });
+          return;
+        }
+        transcript = items.map((item) => item.text).join(' ').replace(/\s+/g, ' ').trim();
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        await send({ step: 'error', message: `Could not download YouTube audio: ${msg}` });
+        await send({
+          step: 'error',
+          message: `Could not fetch captions: ${msg}. Try a video with subtitles/captions enabled.`,
+        });
         return;
       }
-
-      // Step 2: Transcribe
-      await send({ step: 'transcribing', message: 'Transcribing audio...' });
-      const audioFile = await toFile(audioBuffer, 'audio.webm', { type: 'audio/webm' });
-      const transcriptionResponse = await client.audio.transcriptions.create({
-        model: 'gpt-4o-mini-transcribe',
-        file: audioFile,
-        response_format: 'text',
-      });
-      const transcript = transcriptionResponse as unknown as string;
 
       if (!transcript.trim()) {
-        await send({ step: 'error', message: 'No speech detected in the audio.' });
+        await send({ step: 'error', message: 'Transcript is empty.' });
         return;
       }
+
+      // Step 2 (merged): emit transcribing done
+      await send({ step: 'transcribing', message: 'Transcript ready.' });
 
       // Step 3: Translate
       await send({ step: 'translating', message: `Translating to ${language}...` });

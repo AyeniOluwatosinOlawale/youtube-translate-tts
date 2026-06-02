@@ -11,8 +11,8 @@ const LANGUAGES = [
 const VOICES = ['nova', 'alloy', 'echo', 'fable', 'onyx', 'shimmer'];
 
 const STEPS = [
-  { key: 'downloading', label: 'Download audio' },
-  { key: 'transcribing', label: 'Transcribe speech' },
+  { key: 'downloading', label: 'Fetch transcript from YouTube' },
+  { key: 'transcribing', label: 'Transcript ready' },
   { key: 'translating', label: 'Translate text' },
   { key: 'speaking', label: 'Generate audio' },
 ] as const;
