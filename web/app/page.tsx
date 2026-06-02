@@ -197,6 +197,10 @@ export default function Home() {
           if (!part.startsWith('data: ')) continue;
           const d = JSON.parse(part.slice(6));
 
+          if (d.type === 'status') {
+            setStatus(d.message);
+          }
+
           if (d.type === 'total') {
             setTotal(d.count);
             for (let i = 0; i < d.count; i++)
