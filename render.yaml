@@ -1,10 +1,9 @@
 services:
   - type: web
     name: youtube-translator
-    runtime: node
-    rootDir: web
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    runtime: docker
+    dockerfilePath: ./web/Dockerfile
+    dockerContext: ./web
     envVars:
       - key: OPENAI_API_KEY
         sync: false

@@ -2,6 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { YoutubeTranscript } from 'youtube-transcript';
 import { Innertube } from 'youtubei.js';
 import OpenAI, { toFile } from 'openai';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import { readFile, unlink } from 'fs/promises';
+
+const execAsync = promisify(exec);
 
 export const maxDuration = 300;
 
@@ -27,7 +32,43 @@ async function fetchViaPackage(videoId: string): Promise<CaptionItem[] | null> {
 }
 
 /* ------------------------------------------------------------------ */
-/* Strategy 2: youtubei.js getInfo() → caption CDN fetch              */
+/* Strategy 2: yt-dlp --write-auto-subs (handles server IP blocking)  */
+/* yt-dlp uses sophisticated anti-detection that raw API calls can't. */
+/* ------------------------------------------------------------------ */
+async function fetchViaYtDlp(videoId: string): Promise<CaptionItem[] | null> {
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return null;
+  const outBase = `/tmp/ytcc_${videoId}_${Date.now()}`;
+  try {
+    await execAsync(
+      `yt-dlp --skip-download --write-auto-subs --write-subs --sub-langs "en,en-US,en-GB" --sub-format json3 -o "${outBase}" "https://www.youtube.com/watch?v=${videoId}"`,
+      { timeout: 30_000 }
+    );
+  } catch { /* yt-dlp may exit non-zero but still write files */ }
+
+  for (const ext of ['.en.json3', '.en-US.json3', '.en-GB.json3', '.en-orig.json3']) {
+    const file = `${outBase}${ext}`;
+    try {
+      const raw = await readFile(file, 'utf-8');
+      await unlink(file).catch(() => {});
+      const data = JSON.parse(raw);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const events: any[] = data.events ?? [];
+      const items: CaptionItem[] = events
+        .filter(e => e.segs?.length && typeof e.tStartMs === 'number')
+        .map(e => ({
+          text: (e.segs as Array<{ utf8?: string }>).map(s => s.utf8 ?? '').join('').replace(/\n/g, ' ').trim(),
+          offset: e.tStartMs as number,
+          duration: (e.dDurationMs as number) ?? 3000,
+        }))
+        .filter(i => i.text.length > 0);
+      if (items.length > 0) return items;
+    } catch { /* try next extension */ }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Strategy 3: youtubei.js getInfo() → caption CDN fetch              */
 /* getInfo() succeeds from server IPs (YouTube strips streaming URLs  */
 /* but keeps captions in the same player response). We read           */
 /* info.captions.caption_tracks and fetch the CDN JSON directly.     */
@@ -180,10 +221,16 @@ export async function POST(req: NextRequest) {
         if (items) await send({ type: 'status', message: `Found ${items.length} caption segments.` });
 
         if (!items) {
-          const { items: s2, debug } = await fetchViaInnertube(videoId);
-          items = s2;
+          await send({ type: 'status', message: 'Fetching captions via yt-dlp…' });
+          items = await fetchViaYtDlp(videoId);
+          if (items) await send({ type: 'status', message: `yt-dlp: ${items.length} caption segments.` });
+        }
+
+        if (!items) {
+          const { items: s3, debug } = await fetchViaInnertube(videoId);
+          items = s3;
           if (items) await send({ type: 'status', message: `Fetched ${items.length} caption segments.` });
-          else await send({ type: 'status', message: `Server caption fetch failed (${debug}). Trying audio…` });
+          else await send({ type: 'status', message: `Caption fetch: ${debug}. Trying audio transcription…` });
         }
 
         if (!items) {
